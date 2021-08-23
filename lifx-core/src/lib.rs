@@ -84,6 +84,22 @@ impl TryFrom<u8> for Waveform {
     }
 }
 
+impl TryFrom<u8> for MultiZoneEffectType {
+    type Error = Error;
+    fn try_from(val: u8) -> Result<MultiZoneEffectType, Error> {
+        match val {
+            0 => Ok(MultiZoneEffectType::Off),
+            1 => Ok(MultiZoneEffectType::Move),
+            2 => Ok(MultiZoneEffectType::Reserved1),
+            3 => Ok(MultiZoneEffectType::Reserved2),
+            x => Err(Error::ProtocolError(format!(
+                "Unknown effect type {}",
+                x
+            ))),
+        }
+    }
+}
+
 impl TryFrom<u8> for Service {
     type Error = Error;
     fn try_from(val: u8) -> Result<Service, Error> {
@@ -259,6 +275,15 @@ where
     }
 }
 
+impl<T> LittleEndianWriter<MultiZoneEffectType> for T
+where
+    T: WriteBytesExt,
+{
+    fn write_val(&mut self, v: MultiZoneEffectType) -> Result<(), io::Error> {
+        self.write_u8(v as u8)
+    }
+}
+
 trait LittleEndianReader<T> {
     fn read_val(&mut self) -> Result<T, io::Error>;
 }
@@ -332,8 +357,22 @@ impl<R: ReadBytesExt> LittleEndianReader<EchoPayload> for R {
     }
 }
 
+impl<R: ReadBytesExt, T, const N: usize> LittleEndianReader<[T; N]> for R
+where
+    R: LittleEndianReader<T>
+{
+    fn read_val(&mut self) -> Result<[T; N], io::Error> {
+       let mut scratch = Vec::with_capacity(N);
+       for _ in 0..N {
+           scratch.push(self.read_val()?);
+       }
+       let ret = scratch.try_into().map_err(drop).unwrap();
+       Ok(ret)
+    }
+}
+
 macro_rules! unpack {
-    ($msg:ident, $typ:ident, $( $n:ident: $t:ident ),*) => {
+    ($msg:ident, $typ:ident, $( $n:ident: $t:ty ),*) => {
         {
         let mut c = Cursor::new(&$msg.payload);
         $(
@@ -406,6 +445,15 @@ pub enum Waveform {
     HalfSign = 2,
     Triangle = 3,
     Pulse = 4,
+}
+
+#[repr(u8)]
+#[derive(Debug, Copy, Clone)]
+pub enum MultiZoneEffectType {
+    Off = 0,
+    Move = 1,
+    Reserved1 = 2,
+    Reserved2 = 3,
 }
 
 /// Decoded LIFX Messages
@@ -828,6 +876,49 @@ pub enum Message {
         color6: HSBK,
         color7: HSBK,
     },
+
+    /// GetMultiZoneEffect - 507
+    ///
+    /// GetMultiZoneEffect is used to request the currently running firmware effect. The device
+    /// will respond with one [Message::StateMultiZoneEffect]. The device must have the `Linear
+    /// Zones` capability for this message to work.
+    GetMultiZoneEffect,
+
+    /// SetMultiZoneEffect - 508
+    ///
+    /// This message starts a firmware effect on the device. The device will respond with one
+    /// [Message::StateMultiZoneEffect]. The device must have the `Linear Zones` capability for
+    /// this message to work.
+    SetMultiZoneEffect {
+        /// A unique identifier for this effect.
+        instance_id: u32,
+        ty: MultiZoneEffectType,
+        reserved6: u16,
+        /// The period of one cycle of the effect in milliseconds.
+        period: u32,
+        /// The duration of the effect in nanoseconds.
+        duration: u64,
+        reserved7: u64,
+        parameters: [u32; 8],
+    },
+
+    /// StateMultiZoneEffect - 509
+    ///
+    /// The StateMultiZoneEffect message represents the state of the currently running firmware
+    /// effect. It is used in response to [Message::GetMultiZoneEffect] and
+    /// [Message::SetMultiZoneEffect].
+    StateMultiZoneEffect {
+        /// A unique identifier for this effect.
+        instance_id: u32,
+        ty: MultiZoneEffectType,
+        reserved6: u16,
+        /// The period of one cycle of the effect in milliseconds.
+        period: u32,
+        /// The duration of the effect in nanoseconds.
+        duration: u64,
+        reserved7: u64,
+        parameters: [u32; 8],
+    },
 }
 
 impl Message {
@@ -877,6 +968,9 @@ impl Message {
             Message::GetColorZones { .. } => 502,
             Message::StateZone { .. } => 503,
             Message::StateMultiZone { .. } => 506,
+            Message::GetMultiZoneEffect => 507,
+            Message::SetMultiZoneEffect { .. } => 508,
+            Message::StateMultiZoneEffect { .. } => 509,
         }
     }
 
@@ -1009,6 +1103,29 @@ impl Message {
                 color5: HSBK,
                 color6: HSBK,
                 color7: HSBK
+            )),
+            507 => Ok(Message::GetMultiZoneEffect),
+            508 => Ok(unpack!(
+                msg,
+                SetMultiZoneEffect,
+                instance_id: u32,
+                ty: u8,
+                reserved6: u16,
+                period: u32,
+                duration: u64,
+                reserved7: u64,
+                parameters: [u32; 8]
+            )),
+            509 => Ok(unpack!(
+                msg,
+                SetMultiZoneEffect,
+                instance_id: u32,
+                ty: u8,
+                reserved6: u16,
+                period: u32,
+                duration: u64,
+                reserved7: u64,
+                parameters: [u32; 8]
             )),
             _ => Err(Error::UnknownMessageType(msg.protocol_header.typ)),
         }
@@ -1430,7 +1547,8 @@ impl RawMessage {
             | Message::GetGroup
             | Message::LightGet
             | Message::LightGetPower
-            | Message::LightGetInfrared => {
+            | Message::LightGetInfrared
+            | Message::GetMultiZoneEffect => {
                 // these types have no payload
             }
             Message::SetColorZones {
@@ -1673,6 +1791,44 @@ impl RawMessage {
             }
             Message::LightStatePower { level } => {
                 v.write_val(level)?;
+            }
+            Message::SetMultiZoneEffect {
+                instance_id,
+                ty,
+                reserved6,
+                period,
+                duration,
+                reserved7,
+                parameters,
+            } => {
+                v.write_val(instance_id)?;
+                v.write_val(ty)?;
+                v.write_val(reserved6)?;
+                v.write_val(period)?;
+                v.write_val(duration)?;
+                v.write_val(reserved7)?;
+                for parameter in parameters.iter() {
+                    v.write_val(*parameter)?;
+                }
+            }
+            Message::StateMultiZoneEffect {
+                instance_id,
+                ty,
+                reserved6,
+                period,
+                duration,
+                reserved7,
+                parameters,
+            } => {
+                v.write_val(instance_id)?;
+                v.write_val(ty)?;
+                v.write_val(reserved6)?;
+                v.write_val(period)?;
+                v.write_val(duration)?;
+                v.write_val(reserved7)?;
+                for parameter in parameters.iter() {
+                    v.write_val(*parameter)?;
+                }
             }
         }
 
